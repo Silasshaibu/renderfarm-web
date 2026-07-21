@@ -325,3 +325,93 @@ what this doc previously described. Accurate current state:
 - Enterprise ShotGrid integration is config-only scaffolding.
 - Worker scout-resolution logic is a manual Python port of `lib/utils/frames.ts` — keep in sync.
 - Fixes above are local; deploy the web app (git push → Vercel) and restart the worker to take effect.
+
+---
+
+## 2026-07-21 (later same day) — 6 new DCC engines added
+
+The renderfarm-companion worker (`renderfarm_worker.py`) went from Blender+Maya-only to
+supporting **7 engines total**: Blender, Maya, Houdini, Cinema 4D, 3ds Max, Nuke, Katana,
+plus a structurally-separate Unreal Engine path. All 7 Plugins-page cards in the Electron
+app are now enabled (previously only Blender was real; Maya was enabled earlier the same
+day; the rest were permanent "coming soon" placeholders).
+
+**⚠️ Execution-verified vs. spec-verified:** only Maya has actually been end-to-end
+tested against a real render (via Conductor, in an earlier unrelated session on this
+project). Houdini/C4D/3ds Max/Nuke/Katana/Unreal render invocations were researched and
+cross-checked against official vendor docs (Maxon, Autodesk, Foundry, SideFX, Epic) and
+industry-standard render-farm middleware (Deadline) documentation, but **none have been
+run against a real installation**. Treat as implemented-to-spec, not field-verified —
+test each one against a real DCC install before relying on it for a real job.
+
+### What changed
+- **Worker engine dispatch** generalized from a single Blender/Maya `if` to a 7-way
+  `if/elif` keyed on scene file extension (`.blend`/`.ma`/`.mb`/`.hip`/`.hipnc`/`.c4d`/
+  `.max`/`.nk`/`.katana`), plus a structurally separate `render_unreal_job()` path
+  dispatched earlier (keyed on `manifest.software == "unreal"`, since Unreal has no
+  portable single scene file). `render_job()` now takes one `engines` dict instead of
+  positional Blender/Maya path args.
+- **Houdini**: no dedicated CLI render binary exists, so it renders via `hython.exe` +
+  a small driver script (`worker/render_drivers/houdini_render_rop.py`) that loads the
+  `.hip` and calls `hou.node(rop_path).render(frame_range=(start,end,1))`. The addon
+  gained a mandatory "Render Node (ROP)" combo (scans `/out` for Driver-category nodes)
+  since a `.hip` can contain many ROPs and there was previously no way to tell the
+  worker which one to render — this manifest field (`rop_path`) is required.
+- **Cinema 4D / 3ds Max**: real, verified CLI flags for frame range + output
+  (`Commandline.exe -nogui -render ... -frame ... -oimage ... -oformat TIFF` /
+  `3dsmaxcmd.exe -start:N -end:N -outputName:... -rfw:0`). **Renderer selection is NOT
+  overridable via CLI for either app** — confirmed via each vendor's own docs, and
+  independently corroborated by Deadline's docs stating the same limitation for 3ds Max.
+  The scene's own saved renderer (Redshift/Arnold/V-Ray/etc.) is what actually runs
+  regardless of what the addon's UI captures; this is documented in code comments, not
+  silently ignored.
+- **Nuke**: new addon (`dcc-addons/nuke/`) built from scratch, same boilerplate pattern
+  as Maya/Houdini. Scans Read/Precomp file knobs for dependencies. Gained a mandatory
+  "Write Node" combo (same "which output" gap as Houdini's ROPs). Worker invokes
+  `Nuke<ver>.exe -F <start>-<end> -x -X <write_node> script.nk`.
+- **Katana**: new addon (`dcc-addons/katana/`) built from scratch. Dependency scanning
+  is best-effort (Katana's asset-reference API is far less documented than Maya's/
+  Houdini's — flagged explicitly in the addon's own code comments). Gained a mandatory
+  "Render Node" combo. Worker invokes `katanaBin.exe --batch --katana-file=... 
+  --render-node=... -t <start>-<end>`. **Katana's CLI has no output-directory
+  override** — the Render node's own saved `outputName` parameter decides where images
+  land, so the worker's frame-collection step for Katana scans the *entire* work
+  directory for images created during the render (by mtime) rather than a fixed folder.
+- **Unreal**: new addon (`dcc-addons/unreal/`), structurally different from every other
+  addon — Unreal has no single portable scene file, so instead of per-asset SHA-256
+  dependency scanning it zips the *whole project* (`.uproject` + `Content/` + `Config/`)
+  and uploads that as one deduped blob. Manifest shape is genuinely different from the
+  `assets[]`-array convention (`project_zip_url`, `map_name`, `level_sequence`,
+  `moviepipeline_config` instead) — the worker's `render_unreal_job()` downloads+unzips
+  the project, then runs `UnrealEditor-Cmd.exe <uproject> <map> -game
+  -LevelSequence=... -MoviePipelineConfig=... -Unattended -renderoffscreen ...`. Output
+  location/format/frame-range are baked into the MoviePipelineConfig preset asset
+  (must already exist in the project) rather than overridable from the command line —
+  same "scan the whole output area by mtime" fallback as Katana, since MRQ's default
+  output folder isn't guaranteed.
+
+### File map additions
+```
+renderfarm-companion/
+  dcc-addons/
+    houdini/renderfarm_submitter.py   ← v1.1.0, added ROP-selection combo
+    cinema4d/renderfarm_submitter.py  ← v1.0.0, unchanged (already protocol-correct)
+    3dsmax/renderfarm_submitter.py    ← v1.0.0, unchanged (already protocol-correct)
+    nuke/renderfarm_submitter.py      ← NEW, v1.0.0
+    katana/renderfarm_submitter.py    ← NEW, v1.0.0
+    unreal/renderfarm_submitter.py    ← NEW, v1.0.0 (different manifest shape, see above)
+  worker/
+    render_drivers/
+      houdini_render_rop.py           ← NEW, hython driver script
+    renderfarm_worker.py              ← now v2.3, 7-engine dispatch + render_unreal_job()
+```
+
+### Next steps if you want these field-verified
+1. Test each addon inside its actual DCC app: install → connect → submit a small job.
+2. Run the worker on a machine with that DCC installed and confirm it picks up and
+   renders the job correctly (check `find_*()`'s search paths match your actual
+   install location — they're best-guess common paths, override with the matching
+   `*_PATH` env var if not found).
+3. For Cinema 4D/3ds Max specifically: since renderer selection isn't CLI-overridable,
+   make sure the scene's saved renderer already matches what you intend before
+   submitting, or the job will render with whatever was last active in that file.
