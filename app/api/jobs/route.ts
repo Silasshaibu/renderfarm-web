@@ -199,7 +199,20 @@ export async function POST(req: NextRequest) {
   const nextNum   = Number((countRows[0] as Record<string, unknown>).cnt) + 1
   const jobNumber = `RF-${String(nextNum).padStart(4, '0')}`
 
-  const manifest           = data.manifest ? JSON.stringify(data.manifest) : '{}'
+  // Persist scout/chunk data into the manifest for ALL jobs (not just GCP), so the
+  // local render worker can also see it — previously these top-level fields were only
+  // read transiently for the GCP dispatch branch below and never survived to storage.
+  const manifestObj: Record<string, unknown> = data.manifest ? { ...data.manifest } : {}
+  if (data.chunk_size !== undefined && manifestObj.chunk_size === undefined) {
+    manifestObj.chunk_size = data.chunk_size
+  }
+  if (data.scout_frames !== undefined && manifestObj.scout_frames === undefined) {
+    manifestObj.scout_frames = data.scout_frames
+  }
+  if (data.use_scout_frames !== undefined && manifestObj.use_scout_frames === undefined) {
+    manifestObj.use_scout_frames = data.use_scout_frames
+  }
+  const manifest           = JSON.stringify(manifestObj)
   const assetsTotal        = data.assets_total    ?? 0
   const assetsUploaded     = data.assets_uploaded  ?? 0
   const outputPath         = data.output_folder    ?? ''

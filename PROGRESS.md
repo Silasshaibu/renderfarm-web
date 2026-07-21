@@ -1,6 +1,8 @@
 # Renderfarm — Project Progress Notes
 
-> Last updated: 2026-05-24
+> Last updated: 2026-07-21
+> ⚠️ Much of the detail below (written 2026-05-24) describes an earlier stage of the project.
+> See the "2026-07-21 Audit & Fixes" section at the bottom for the accurate current state.
 
 ---
 
@@ -211,14 +213,13 @@ A Python script that runs on a local machine (or eventually a cloud VM) and proc
 
 ## Outstanding / Next Steps ⚠️
 
-### 1. 🔴 Render Worker Needs Updating for v7 (CRITICAL)
-**Problem:** The worker was written for v5/v6 submission flow where a single zip blob URL was stored in `blenderFile`. The v7 system uploads assets individually and stores a manifest. The worker needs to:
-1. Read `job.manifest.assets[]` from the API response
-2. Download each asset to its `path` relative to a temp working dir
-3. The main `.blend` file is `type == "blend"` in the manifest
-4. Run Blender on the downloaded `.blend` file
-
-**Fix needed:** Update `renderfarm_worker.py` to use the manifest-based approach.
+### 1. ✅ Render Worker v7 Support — DONE (2026-05-25)
+`renderfarm_worker.py` (now v2.2) has a fully implemented `prepare_scene_v7()` that reads
+`job.manifest.assets[]`, downloads each asset to its relative path, locates the
+`type == "blend"` entry, and renders it. It also gained (undocumented until the
+2026-07-21 audit): GPU detection + GPU-job holding, wrangler max-runtime integration,
+a `--companion` auto-download daemon mode, per-task status/log API reporting,
+scout-frame (sparse list) rendering, and download retry logic.
 
 ### 2. 🟡 Test Full End-to-End Pipeline
 After fixing the render worker, test the complete flow:
@@ -258,16 +259,69 @@ renderfarm.swade-art.com/          ← Next.js web app (this repo, on Vercel)
 
 renderfarm-companion/              ← Local tools (NOT on Vercel)
   blender-addon/
-    renderfarm_submitter.py        ← Blender addon source (v7)
+    renderfarm_submitter.py        ← Blender addon source (addon v2.1.3, protocol v7)
     renderfarm_submitter_v7.zip    ← Latest installable addon (INSTALL THIS)
+  dcc-addons/                      ← Maya, Houdini, Cinema 4D, 3ds Max submitters (v1.0.0 each)
   worker/
-    renderfarm_worker.py           ← Python render worker (needs v7 update)
+    renderfarm_worker.py           ← Python render worker v2.2 (v6 + v7, GPU, wrangler, companion mode)
     test_upload.py                 ← End-to-end upload test script
   src/                             ← Electron app source
     main/index.ts                  ← Electron main process + IPC handlers
     renderer/src/
       App.tsx                      ← Root component
-      pages/Downloader.tsx         ← Job list + download UI
+      pages/                       ← Plugins, Downloader, SubmissionKit, Help & Resources
   out/                             ← Compiled Electron app (run this)
   launch.cjs                       ← Launch script (clears ELECTRON_RUN_AS_NODE)
 ```
+
+---
+
+## 2026-07-21 Audit & Fixes
+
+A full read-through of the codebase (two parallel audits) found the project far ahead of
+what this doc previously described. Accurate current state:
+
+### What's real and working
+- **Billing — production-grade.** Real Stripe SDK (customers, paymentIntents, setupIntents,
+  signature-verified webhooks) + real Paystack (HMAC-SHA512-verified webhooks, live USD→NGN
+  conversion). Monthly billing cron charges saved cards off-session, retries declines,
+  suspends accounts after 3 failures, sends transactional emails. (`lib/billing.ts`, `lib/payments.ts`)
+- **GCP dispatch — a real second render path.** `lib/gcp/compute.ts` spins up actual GCP VMs
+  via `@google-cloud/compute` with a startup script (gsutil download → headless Blender →
+  upload → self-delete). Independent of, and parallel to, the local Python worker.
+- **CMS admin panel — real, separate auth stack.** Own superadmin/session/audit tables,
+  bcrypt, IP whitelist, rate limiting, and a correct hand-rolled RFC 6238 TOTP (`lib/totp.ts`).
+- **Virtual Wrangler — half real.** `max_runtime` and `syncer` policies genuinely mutate
+  tasks via the 5-min cron (`virtual-wrangler/run`). `relocation` and `spot_to_ondemand`
+  are cosmetic — they only write status text/log events; nothing consumes them yet.
+- **Electron app** — real pages are Plugins, Downloader, Submission Kit, Help & Resources
+  (the old Usage/Calculator/Admin/Profile placeholders are gone).
+- **Enterprise (ShotGrid, instances, env-vars) — stubs.** Config CRUD only; no outbound
+  ShotGrid API calls exist anywhere.
+
+### Bugs found and FIXED (2026-07-21)
+1. **Wrangler max-runtime never reached the worker.** Worker read flat keys
+   (`maxRuntimeOn`/`maxRuntime`/`runtimeAction`) that no API ever returned; settings are
+   stored nested under `max_runtime` as `{enabled, max_hours, action}`. Worker silently
+   always used hardcoded defaults (2h/Kill). → `renderfarm_worker.py` now reads the nested shape.
+2. **Scout frames were dead code for local-worker jobs.** `POST /api/jobs` only consumed
+   scout/chunk fields in the GCP branch; the worker always overrode frames to the full
+   `frame_start-frame_end` range. → API now persists `chunk_size`/`scout_frames`/
+   `use_scout_frames` into the manifest for ALL jobs, and the worker resolves scout
+   expressions (`fml:N`, `auto:N`, explicit lists — Python port of
+   `lib/utils/frames.ts:resolveScoutFrames`) and renders only the scout subset when enabled.
+3. **Electron Submission Kit created guaranteed-to-fail jobs.** Non-GCP submits sent
+   metadata only (and fabricated a fake asset path) — no scene file, empty manifest; the
+   worker instantly failed them. → New `jobs:submitWithScene` IPC flow: real file picker,
+   SHA-256 hashing, `/jobs/preflight` dedup, Vercel Blob token/PUT/confirm per asset,
+   proper v7 manifest, upload progress events. GCP path untouched. (`main/index.ts`,
+   `preload/index.ts`, `env.d.ts`, `SubmissionKit.tsx`)
+4. **API base URL default inconsistency.** Worker defaulted to `renderfarm.swade-art.com/api`
+   while addon + Electron use `renderfarm-web.vercel.app/api`. → Worker default aligned to
+   `renderfarm-web.vercel.app/api` (override with `RF_API_BASE`).
+
+### Known remaining gaps
+- Wrangler `relocation` / `spot_to_ondemand` actions are cosmetic (no consumer).
+- Enterprise ShotGrid integration is config-only scaffolding.
+- Worker scout-resolution logic is a manual Python port of `lib/utils/frames.ts` — keep in sync.
+- Fixes above are local; deploy the web app (git push → Vercel) and restart the worker to take effect.
